@@ -1,142 +1,183 @@
+//! Pure-Rust QUIC AES-128-GCM packet / header protection (no ring / no cc).
+//!
+//! Quinn requires `TLS13_AES_128_GCM_SHA256` with a non-`None` `quic` algorithm
+//! for initial secrets (RFC 9001).
+
 #![allow(clippy::duplicate_mod)]
 
 #[cfg(feature = "alloc")]
 use alloc::boxed::Box;
 
-use aead::AeadCore;
-use chacha20poly1305::{AeadInPlace, KeyInit, KeySizeUser};
-use crypto_common::typenum::Unsigned;
+use aes::cipher::{BlockEncrypt, KeyInit as AesKeyInit, generic_array::GenericArray};
+use aes::Aes128;
+use aes_gcm::aead::KeyInit as GcmKeyInit;
+use aes_gcm::{AeadInPlace, Aes128Gcm, Nonce as GcmNonce, Tag as GcmTag};
 use rustls::crypto::cipher::{self, AeadKey, Iv};
-use rustls::{quic, Error, Tls13CipherSuite};
+use rustls::{quic, Error};
 
-#[allow(dead_code)] // TODO
-pub struct HeaderProtectionKey(AeadKey);
+/// AES-ECB based header protection (RFC 9001 §5.4.1 / §5.4.3).
+pub struct Aes128HeaderProtectionKey {
+    key: Aes128,
+}
 
-impl HeaderProtectionKey {
+impl Aes128HeaderProtectionKey {
     pub fn new(key: AeadKey) -> Self {
-        Self(key)
+        Self {
+            key: Aes128::new_from_slice(key.as_ref()).expect("AES-128 key length"),
+        }
+    }
+
+    fn new_mask(&self, sample: &[u8]) -> Result<[u8; 5], Error> {
+        if sample.len() < 16 {
+            return Err(Error::General("sample of invalid length".into()));
+        }
+        let mut block = GenericArray::clone_from_slice(&sample[..16]);
+        self.key.encrypt_block(&mut block);
+        let mut mask = [0u8; 5];
+        mask.copy_from_slice(&block[..5]);
+        Ok(mask)
+    }
+
+    fn xor_in_place(
+        &self,
+        sample: &[u8],
+        first: &mut u8,
+        packet_number: &mut [u8],
+        masked: bool,
+    ) -> Result<(), Error> {
+        let mask = self.new_mask(sample)?;
+        let (first_mask, pn_mask) = mask.split_first().unwrap();
+
+        if packet_number.len() > pn_mask.len() {
+            return Err(Error::General("packet number too long".into()));
+        }
+
+        const LONG_HEADER_FORM: u8 = 0x80;
+        let bits = if *first & LONG_HEADER_FORM == LONG_HEADER_FORM {
+            0x0f
+        } else {
+            0x1f
+        };
+
+        let first_plain = if masked {
+            *first ^ (first_mask & bits)
+        } else {
+            *first
+        };
+        let pn_len = (first_plain & 0x03) as usize + 1;
+
+        *first ^= first_mask & bits;
+        for (dst, m) in packet_number.iter_mut().zip(pn_mask).take(pn_len) {
+            *dst ^= m;
+        }
+        Ok(())
     }
 }
 
-impl quic::HeaderProtectionKey for HeaderProtectionKey {
+impl quic::HeaderProtectionKey for Aes128HeaderProtectionKey {
     fn encrypt_in_place(
         &self,
-        _sample: &[u8],
-        _first: &mut u8,
-        _packet_number: &mut [u8],
+        sample: &[u8],
+        first: &mut u8,
+        packet_number: &mut [u8],
     ) -> Result<(), Error> {
-        todo!()
+        self.xor_in_place(sample, first, packet_number, false)
     }
 
     fn decrypt_in_place(
         &self,
-        _sample: &[u8],
-        _first: &mut u8,
-        _packet_number: &mut [u8],
+        sample: &[u8],
+        first: &mut u8,
+        packet_number: &mut [u8],
     ) -> Result<(), Error> {
-        todo!()
+        self.xor_in_place(sample, first, packet_number, true)
     }
 
     #[inline]
     fn sample_len(&self) -> usize {
-        todo!()
+        16
     }
 }
 
-pub struct PacketKey {
-    /// Computes unique nonces for each packet
+/// AES-128-GCM packet keys for QUIC.
+pub struct Aes128GcmPacketKey {
     iv: Iv,
-
-    /// The cipher suite used for this packet key
-    #[allow(dead_code)]
-    suite: &'static Tls13CipherSuite,
-
-    crypto: chacha20poly1305::ChaCha20Poly1305,
+    crypto: Aes128Gcm,
 }
 
-impl PacketKey {
-    pub fn new(suite: &'static Tls13CipherSuite, key: AeadKey, iv: Iv) -> Self {
+impl Aes128GcmPacketKey {
+    pub fn new(key: AeadKey, iv: Iv) -> Self {
         Self {
             iv,
-            suite,
-            crypto: chacha20poly1305::ChaCha20Poly1305::new_from_slice(key.as_ref())
-                .expect("key should be valid"),
+            crypto: <Aes128Gcm as GcmKeyInit>::new_from_slice(key.as_ref()).expect("AES-GCM key"),
         }
     }
 }
 
-impl quic::PacketKey for PacketKey {
+impl quic::PacketKey for Aes128GcmPacketKey {
     fn encrypt_in_place(
         &self,
         packet_number: u64,
         aad: &[u8],
         payload: &mut [u8],
     ) -> Result<quic::Tag, Error> {
-        let nonce = cipher::Nonce::new(&self.iv, packet_number).0;
-
+        let nonce_bytes = cipher::Nonce::new(&self.iv, packet_number).0;
+        let nonce = GcmNonce::from_slice(&nonce_bytes);
         let tag = self
             .crypto
-            .encrypt_in_place_detached(&nonce.into(), aad, payload)
-            .map_err(|_| rustls::Error::EncryptError)?;
+            .encrypt_in_place_detached(nonce, aad, payload)
+            .map_err(|_| Error::EncryptError)?;
         Ok(quic::Tag::from(tag.as_ref()))
     }
 
-    /// Decrypt a QUIC packet
-    ///
-    /// Takes the packet `header`, which is used as the additional authenticated
-    /// data, and the `payload`, which includes the authentication tag.
-    ///
-    /// If the return value is `Ok`, the decrypted payload can be found in
-    /// `payload`, up to the length found in the return value.
     fn decrypt_in_place<'a>(
         &self,
         packet_number: u64,
         aad: &[u8],
         payload: &'a mut [u8],
     ) -> Result<&'a [u8], Error> {
-        let mut payload_ = payload.to_vec();
-        let payload_len = payload_.len();
-        let nonce = chacha20poly1305::Nonce::from(cipher::Nonce::new(&self.iv, packet_number).0);
-
+        let payload_len = payload.len();
+        if payload_len < 16 {
+            return Err(Error::DecryptError);
+        }
+        let (body, tag_bytes) = payload.split_at_mut(payload_len - 16);
+        let nonce_bytes = cipher::Nonce::new(&self.iv, packet_number).0;
+        let nonce = GcmNonce::from_slice(&nonce_bytes);
+        let tag = GcmTag::from_slice(tag_bytes);
         self.crypto
-            .decrypt_in_place(&nonce, aad, &mut payload_)
-            .map_err(|_| rustls::Error::DecryptError)?;
-
-        // Unfortunately the lifetime bound on decrypt_in_place sucks
-        payload.copy_from_slice(&payload_);
-
-        let plain_len = payload_len - self.tag_len();
-        Ok(&payload[..plain_len])
+            .decrypt_in_place_detached(nonce, aad, body, tag)
+            .map_err(|_| Error::DecryptError)?;
+        Ok(&payload[..payload_len - 16])
     }
 
-    /// Tag length for the underlying AEAD algorithm
     #[inline]
     fn tag_len(&self) -> usize {
-        <chacha20poly1305::ChaCha20Poly1305 as AeadCore>::TagSize::to_usize()
+        16
     }
 
     fn integrity_limit(&self) -> u64 {
-        1 << 36
+        1 << 52
     }
 
     fn confidentiality_limit(&self) -> u64 {
-        u64::MAX
+        1 << 23
     }
 }
 
-#[allow(dead_code)] // TODO
-pub struct KeyBuilder(AeadKey);
+pub struct Aes128GcmQuicAlgorithm;
 
-impl rustls::quic::Algorithm for KeyBuilder {
-    fn packet_key(&self, _key: AeadKey, _iv: Iv) -> Box<dyn quic::PacketKey> {
-        todo!()
+impl quic::Algorithm for Aes128GcmQuicAlgorithm {
+    fn packet_key(&self, key: AeadKey, iv: Iv) -> Box<dyn quic::PacketKey> {
+        Box::new(Aes128GcmPacketKey::new(key, iv))
     }
 
     fn header_protection_key(&self, key: AeadKey) -> Box<dyn quic::HeaderProtectionKey> {
-        Box::new(HeaderProtectionKey::new(key))
+        Box::new(Aes128HeaderProtectionKey::new(key))
     }
 
     fn aead_key_len(&self) -> usize {
-        chacha20poly1305::ChaCha20Poly1305::key_size()
+        16
     }
 }
+
+pub static AES_128_GCM_QUIC: Aes128GcmQuicAlgorithm = Aes128GcmQuicAlgorithm;

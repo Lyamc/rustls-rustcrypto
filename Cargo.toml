@@ -22,7 +22,7 @@ aead = { version = "0.5.2", default-features = false }
 # aes 0.8 has no `aesni` cargo feature. AES-NI is selected at runtime by
 # cpufeatures unless the build sets `--cfg aes_force_soft`. Do not set that.
 aes = { version = "0.8", default-features = false, features = ["zeroize"] }
-aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
+aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc"] }
 chacha20poly1305 = { version = "0.10.1", default-features = false }
 crypto-common = { version = "0.1.6", default-features = false }
 der = { version = "0.7.9", default-features = false }
